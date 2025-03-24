@@ -310,6 +310,113 @@ class Manager {
 		return $source->get_item( $template_id );
 	}
 
+	public function move_template( array $args ) {
+		$validate_args = $this->ensure_args( [ 'source', 'from_source', 'from_template_id' ], $args );
+
+		if ( is_wp_error( $validate_args ) ) {
+			return $validate_args;
+		}
+
+		$args['source'] = $args['source'][0];
+
+		$result = $this->move_template_item( $args );
+
+		if ( ! $this->is_action_to_same_source( $args ) ) {
+			$this->delete_original_template( $args );
+		}
+
+		return $result;
+	}
+
+	private function move_template_item( array $args ) {
+		$validate_args = $this->ensure_args( [ 'source', 'from_source', 'from_template_id' ], $args );
+
+		if ( is_wp_error( $validate_args ) ) {
+			return $validate_args;
+		}
+
+		$source = $this->get_source( $args['source'] );
+
+		if ( ! $source ) {
+			return new \WP_Error( 'template_error', 'Template source not found.' );
+		}
+
+		if ( $this->is_action_to_same_source( $args ) ) {
+			return $source->move_template_to_folder( $args );
+		}
+
+		if ( 'local' === $args['from_source'] ) {
+			$args = $this->format_args_for_move_template_from_local_to_cloud( $args );
+		}
+
+		if ( 'cloud' === $args['from_source'] ) {
+			$args = $this->format_args_for_move_template_from_cloud_to_local( $args );
+		}
+
+		$template_id = $source->save_item( $args );
+
+		if ( is_wp_error( $template_id ) ) {
+			return $template_id;
+		}
+
+		return $source->get_item( $template_id );
+	}
+
+	private function delete_original_template( $args ) {
+		$validate_args = $this->ensure_args( [ 'from_source', 'from_template_id' ], $args );
+
+		if ( is_wp_error( $validate_args ) ) {
+			return $validate_args;
+		}
+
+		$from_source = $this->get_source( $args['from_source'] );
+
+		if ( ! $from_source ) {
+			return new \WP_Error( 'template_error', 'Template source not found.' );
+		}
+
+		$from_source->delete_template( $args['from_template_id'] );
+	}
+
+	private function is_action_to_same_source( $args ) {
+		return $args['source'] === $args['from_source'];
+	}
+
+	private function format_args_for_move_template_from_local_to_cloud( $args ) {
+		$document = Plugin::$instance->documents->get( $args['from_template_id'] );
+
+		if ( ! $document ) {
+			return new \WP_Error( 'template_error', 'Document not found.' );
+		}
+
+		$args['content'] = $document->get_elements_data();
+
+		$page = SettingsManager::get_settings_managers( 'page' )->get_model( $args['from_template_id'] );
+		$args['page_settings'] = $page->get_data( 'settings' );
+
+		return $args;
+	}
+
+	private function format_args_for_move_template_from_cloud_to_local( $args ) {
+		$from_source = $this->get_source( $args['from_source'] );
+
+		if ( ! $from_source ) {
+			return new \WP_Error( 'template_error', 'Template source not found.' );
+		}
+
+		$data = $from_source->get_item( $args['from_template_id'] );
+
+		if ( is_wp_error( $data ) || empty( $data['content'] ) ) {
+			return $data;
+		}
+
+		$decoded_data = json_decode( $data['content'], true );
+		$args['content'] = $decoded_data['content'];
+		$args['page_settings'] = $decoded_data['page_settings'];
+
+		return $args;
+	}
+
 	/**
 	 * Update template.
 	 *
@@ -753,6 +860,41 @@ class Manager {
 	}
 
 	/**
+	 * @throws \Exception
+	 */
+	public function save_template_screenshot( $data ): string {
+		$validate_args = $this->ensure_args( [ 'template_id', 'screenshot' ], $data );
+
+		if ( is_wp_error( $validate_args ) ) {
+			return $validate_args;
+		}
+
+		$raw_binary = base64_decode( substr( $data['screenshot'], strlen( 'data:image/png;base64,' ) ) );
+
+		return $this->get_source( 'cloud' )->save_item_preview( $data['template_id'], $raw_binary );
+	}
+
+	public function bulk_delete_templates( $data ) {
+		$validate_args = $this->ensure_args( [ 'template_ids', 'source' ], $data );
+
+		if ( is_wp_error( $validate_args ) ) {
+			return $validate_args;
+		}
+
+		$source = $this->get_source( $data['source'] );
+
+		if ( ! $source ) {
+			return new \WP_Error( 'template_error', 'Template source not found.' );
+		}
+
+		if ( empty( $data['template_ids'] ) || ! is_array( $data['template_ids'] ) ) {
+			return new \WP_Error( 'template_error', 'Template IDs are missing.' );
+		}
+
+		return $source->bulk_delete_items( $data['template_ids'] );
+	}
+
+	/**
 	 * Init ajax calls.
 	 *
 	 * Initialize template library ajax calls for allowed ajax requests.
@@ -778,6 +920,11 @@ class Manager {
 			'load_more_templates',
 			'create_folder',
 			'get_folders',
+			'save_template_screenshot',
+			'move_template',
+			'bulk_move_templates',
+			'bulk_delete_templates',
+			'bulk_copy_templates',
 		];
 
 		foreach ( $library_ajax_requests as $ajax_request ) {
@@ -916,5 +1063,123 @@ class Manager {
 		}
 
 		return true;
+	}
+
+	public function bulk_move_templates( array $args ) {
+		$validate_args = $this->ensure_args( [ 'source', 'from_source', 'from_template_id' ], $args );
+
+		if ( is_wp_error( $validate_args ) ) {
+			return $validate_args;
+		}
+
+		$args['source'] = $args['source'][0];
+
+		return $this->bulk_move_template_items( $args );
+	}
+
+	private function bulk_move_template_items( array $args ) {
+		$source = $this->get_source( $args['source'] );
+
+		if ( ! $source ) {
+			return new \WP_Error( 'template_error', 'Template source not found.' );
+		}
+
+		if ( $this->is_action_to_same_source( $args ) ) {
+			return $source->move_bulk_templates_to_folder( $args );
+		}
+
+		$bulk_args = 'local' === $args['from_source']
+			? $this->format_args_for_bulk_action_from_local( $args )
+			: $this->format_args_for_bulk_action_from_cloud( $args );
+
+		$bulk_save = $source->save_bulk_items( $bulk_args );
+
+		if ( ! empty( $bulk_save ) ) {
+			$this->bulk_delete_templates( [
+				'template_ids' => $args['from_template_id'],
+				'source' => $args['from_source'],
+			] );
+		}
+
+		return $bulk_save;
+	}
+
+	private function format_args_for_bulk_action_from_local( $args ) {
+		$bulk_args = [];
+
+		foreach ( $args['from_template_id'] as $from_template_id ) {
+			$document = Plugin::$instance->documents->get( $from_template_id );
+
+			if ( ! $document ) {
+				continue;
+			}
+
+			$page = SettingsManager::get_settings_managers( 'page' )->get_model( $from_template_id );
+
+			$bulk_args[] = array_merge(
+				$args,
+				[
+					'title' => $document->get_post()->post_title,
+					'type' => $document::get_type(),
+					'content' => $document->get_elements_data(),
+					'page_settings' => $page->get_data( 'settings' ),
+				]
+			);
+		}
+
+		return $bulk_args;
+	}
+
+	private function format_args_for_bulk_action_from_cloud( $args ) {
+		$from_source = $this->get_source( $args['from_source'] );
+
+		if ( ! $from_source ) {
+			return new \WP_Error( 'template_error', 'Template source not found.' );
+		}
+
+		$templates = $from_source->get_bulk_items( $args );
+		$bulk_args = [];
+
+		foreach ( $templates as $template ) {
+			$content = json_decode( $template['content'], true );
+
+			$bulk_args[] = array_merge(
+				$args,
+				[
+					'title' => $template['title'],
+					'type' => $template['type'],
+					'content' => $content['content'],
+					'page_settings' => $content['page_settings'],
+				]
+			);
+		}
+
+		return $bulk_args;
+	}
+
+	public function bulk_copy_templates( array $args ) {
+		$validate_args = $this->ensure_args( [ 'source', 'from_source', 'from_template_id' ], $args );
+
+		if ( is_wp_error( $validate_args ) ) {
+			return $validate_args;
+		}
+
+		$args['source'] = $args['source'][0];
+
+		return $this->bulk_copy_template_items( $args );
+	}
+
+	private function bulk_copy_template_items( array $args ) {
+		$source = $this->get_source( $args['source'] );
+
+		if ( ! $source ) {
+			return new \WP_Error( 'template_error', 'Template source not found.' );
+		}
+
+		$bulk_args = 'local' === $args['from_source']
+			? $this->format_args_for_bulk_action_from_local( $args )
+			: $this->format_args_for_bulk_action_from_cloud( $args );
+
+		return $source->save_bulk_items( $bulk_args );
 	}
 }

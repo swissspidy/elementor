@@ -4,6 +4,8 @@ const FolderCollectionView = require( './folders/folders-list' );
 
 const LOAD_MORE_ID = 0;
 
+import { SAVE_CONTEXTS } from './../../constants';
+
 const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 	id: 'elementor-template-library-save-template',
 
@@ -20,6 +22,10 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 		selectedFolder: '.selected-folder',
 		selectedFolderText: '.selected-folder-text',
 		hiddenInputSelectedFolder: '#parentId',
+		templateNameInput: '#elementor-template-library-save-template-name',
+		localInput: '.source-selections-input.local',
+		cloudInput: '.source-selections-input.cloud',
+		sourceSelectionCheckboxes: '.source-selections-input input[type="checkbox"]',
 	},
 
 	events: {
@@ -28,11 +34,50 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 		'click @ui.foldersList': 'onFoldersListClick',
 		'click @ui.removeFolderSelection': 'onRemoveFolderSelectionClick',
 		'click @ui.selectedFolderText': 'onSelectedFolderTextClick',
+		'change @ui.sourceSelectionCheckboxes': 'maybeAllowOnlyOneCheckboxToBeChecked',
+	},
+
+	onRender() {
+		const context = this.getOption( 'context' );
+
+		if ( SAVE_CONTEXTS.SAVE === context ) {
+			this.$( '.source-selections-input #cloud' ).prop( 'checked', true );
+		}
+
+		if ( SAVE_CONTEXTS.MOVE === context ) {
+			this.handleMoveContextUiState();
+		}
+
+		if ( SAVE_CONTEXTS.BULK_MOVE === context || SAVE_CONTEXTS.BULK_COPY === context ) {
+			this.handleBulkActionContextUiState();
+		}
+	},
+
+	handleMoveContextUiState() {
+		this.ui.templateNameInput.val( this.model.get( 'title' ) );
+		this.handleContextUiStateChecboxes();
+	},
+
+	handleBulkActionContextUiState() {
+		this.ui.templateNameInput.remove();
+		this.handleContextUiStateChecboxes();
+	},
+
+	handleContextUiStateChecboxes() {
+		const fromSource = elementor.templates.getFilter( 'source' );
+
+		if ( 'local' === fromSource ) {
+			this.$( '.source-selections-input #cloud' ).prop( 'checked', true );
+			this.ui.localInput.addClass( 'disabled' );
+		}
 	},
 
 	getSaveType() {
 		let type;
-		if ( this.model ) {
+
+		if ( SAVE_CONTEXTS.MOVE === this.getOption( 'context' ) ) {
+			type = this.model.get( 'type' );
+		} else if ( this.model ) {
 			type = this.model.get( 'elType' );
 		} else if ( elementor.config.document.library && elementor.config.document.library.save_as_same_type ) {
 			type = elementor.config.document.type;
@@ -44,26 +89,34 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 	},
 
 	templateHelpers() {
-		var saveType = this.getSaveType(),
-			templateType = elementor.templates.getTemplateTypes( saveType );
+		const saveType = this.getSaveType(),
+			templateType = elementor.templates.getTemplateTypes( saveType ),
+			saveContext = this.getOption( 'context' );
 
-		return templateType.saveDialog;
+		return templateType[ `${ saveContext }Dialog` ];
 	},
 
 	onFormSubmit( event ) {
 		event.preventDefault();
 
 		var formData = this.ui.form.elementorSerializeObject(),
-			saveType = this.getSaveType(),
 			JSONParams = { remove: [ 'default' ] };
 
 		formData.content = this.model ? [ this.model.toJSON( JSONParams ) ] : elementor.elements.toJSON( JSONParams );
 
-		this.ui.submitButton.addClass( 'elementor-button-state' );
-
 		this.updateSourceSelections( formData );
 
-		elementor.templates.saveTemplate( saveType, formData );
+		if ( ! formData?.source && this.templateHelpers()?.canSaveToCloud ) {
+			this.showEmptySourceErrorDialog();
+
+			return;
+		}
+
+		this.ui.submitButton.addClass( 'elementor-button-state' );
+
+		this.updateSaveContext( formData );
+
+		elementor.templates.saveTemplate( this.getSaveType(), formData );
 	},
 
 	updateSourceSelections( formData ) {
@@ -78,7 +131,46 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 		[ 'cloud', 'local' ].forEach( ( type ) => delete formData[ type ] );
 	},
 
+	showEmptySourceErrorDialog() {
+		elementorCommon.dialogsManager.createWidget( 'alert', {
+			id: 'elementor-template-library-error-dialog',
+			headerMessage: __( 'An error occured.', 'elementor' ),
+			message: __( 'Please select at least one location.', 'elementor' ),
+		} ).show();
+	},
+
+	updateSaveContext( formData ) {
+		const saveContext = this.getOption( 'context' ) ?? SAVE_CONTEXTS.SAVE;
+
+		formData.save_context = saveContext;
+
+		if ( [ SAVE_CONTEXTS.MOVE, SAVE_CONTEXTS.BULK_MOVE, SAVE_CONTEXTS.BULK_COPY ].includes( saveContext ) ) {
+			formData.from_source = elementor.templates.getFilter( 'source' );
+			formData.from_template_id = SAVE_CONTEXTS.MOVE === saveContext
+				? this.model.get( 'template_id' )
+				: Array.from( elementor.templates.getBulkSelectionItems() );
+
+			this.updateSourceState( formData );
+		}
+	},
+
+	updateSourceState( formData ) {
+		if ( ! formData.source.length ) {
+			return;
+		}
+
+		const lastSource = formData.source.at( -1 );
+		elementor.templates.setSourceSelection( lastSource );
+		elementor.templates.setFilter( 'source', lastSource, true );
+	},
+
 	onSelectedFolderTextClick() {
+		if ( ! this.folderCollectionView ) {
+			this.onEllipsisIconClick();
+
+			return;
+		}
+
 		if ( ! this.ui.foldersDropdown.is( ':visible' ) ) {
 			this.ui.foldersDropdown.show();
 		}
@@ -105,6 +197,7 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 				await this.fetchFolders();
 			} finally {
 				this.removeSpinner();
+				this.disableSelectedFolder();
 			}
 		}
 	},
@@ -159,8 +252,24 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 		} );
 	},
 
+	disableSelectedFolder() {
+		if ( ! SAVE_CONTEXTS.MOVE === this.getOption( 'context' ) ) {
+			return;
+		}
+
+		if ( ! Number.isInteger( this.model.get( 'parentId' ) ) ) {
+			return;
+		}
+
+		this.$( `.folder-list li[data-id="${ this.model.get( 'parentId' ) }"]` ).addClass( 'disabled' );
+	},
+
 	onFoldersListClick( event ) {
 		const { id, value } = event.target.dataset;
+
+		if ( ! id || ! value ) {
+			return;
+		}
 
 		if ( this.clickedOnLoadMore( id ) ) {
 			this.loadMoreFolders();
@@ -210,6 +319,7 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 			await this.fetchFolders();
 		} finally {
 			this.removeSpinner();
+			this.disableSelectedFolder();
 		}
 	},
 
@@ -230,6 +340,32 @@ const TemplateLibrarySaveTemplateView = Marionette.ItemView.extend( {
 		if ( loadMore ) {
 			this.folderCollectionView.collection.remove( loadMore );
 		}
+	},
+
+	maybeAllowOnlyOneCheckboxToBeChecked( event ) {
+		if ( this.moreThanOneCheckboxCanBeChecked() ) {
+			return;
+		}
+
+		const selectedCheckbox = event.currentTarget;
+
+		this.ui.sourceSelectionCheckboxes.each( ( _, checkbox ) => {
+			const wrapper = this.$( checkbox ).closest( '.source-selections-input' );
+
+			if ( checkbox !== selectedCheckbox ) {
+				if ( selectedCheckbox.checked ) {
+					wrapper.addClass( 'disabled' );
+					checkbox.checked = false;
+				} else {
+					wrapper.removeClass( 'disabled' );
+				}
+			}
+		} );
+	},
+
+	moreThanOneCheckboxCanBeChecked() {
+		return SAVE_CONTEXTS.SAVE === this.getOption( 'context' ) ||
+			'cloud' !== elementor.templates.getFilter( 'source' );
 	},
 } );
 
